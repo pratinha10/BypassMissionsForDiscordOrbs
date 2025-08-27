@@ -32,7 +32,7 @@ Este script ajuda a automatizar o progresso das **Missões do Discord**.
 ➡️ Faz download do cliente PTB.
 
 ### ❓ Não consigo colar o código no Console (mensagem amarela)
-➡️ Escreve o comando: `allow pasting` ou `permitir colagem`
+➡️ Escreve o comando: `allow pasting` ou `permitir colagem` na console do DevTools
 
 ### ❓ Aparece um erro diferente
 ➡️ Garante que **iniciaste a transmissão** antes de executar o comando.  
