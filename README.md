@@ -6,6 +6,16 @@
 
 Este script ajuda a automatizar o progresso das **Missões do Discord**.  
 
+---
+
+## 📑 Índice
+- [⚡ Como usar](#-como-usar)  
+- [🧪 Atenção](#-atenção)  
+- [❓ Perguntas Frequentes](#-perguntas-frequentes)  
+- [🎥 Exemplos em vídeo](#-exemplos-em-vídeo)  
+
+---
+
 ## 🧪 ATENÇÃO!
 - ℹ️ **Missões do tipo Vídeo** podem ser feitas no navegador, sem necessidade de instalar nada.
 - ℹ️ **Missões do tipo Jogo** precisam obrigatóriamente de utilizar a versão **Discord PTB** [faz o download aqui](https://discord.com/api/download/ptb).  
@@ -31,10 +41,16 @@ Este script ajuda a automatizar o progresso das **Missões do Discord**.
 ### ❓ Ctrl + Shift + I não funciona
 ➡️ Faz download do cliente PTB.
 
-### ❓ Não consigo colar o código no Console (mensagem amarela)
+### ❓ Não consigo colar o código no Console
 ➡️ Escreve o comando: `allow pasting` ou `permitir colagem` na console do DevTools
 
 ### ❓ Aparece um erro diferente
 ➡️ Garante que **iniciaste a transmissão** antes de executar o comando.  
 ➡️ Verifica também se estás a **copiar/colar corretamente** o código.  
 
+---
+
+## 🎥 Exemplos em vídeo
+
+- 📺 **Missão do tipo Vídeo**: [Ver tutorial](https://www.youtube.com/watch?v=4Mnwsk1Rluw)  
+- 🎮 **Missão do tipo Jogo**: [Ver tutorial](https://www.youtube.com/watch?v=l7-BqKKcLho)  
