@@ -5,12 +5,13 @@
 
   const CONFIG = {
     NAME: "Missions",
-    VERSION: "v4.9.7",
+    VERSION: "v4.10.3",
     THEME: "#5865F2", // discord blurple
     SUCCESS: "#3BA55C",
     WARN: "#faa61a",
     ERR: "#f04747",
-    HIDE_ACTIVITY: false, // suppress RPC status from friends list
+    HIDE_ACTIVITY: false, // hide "Playing ..." while quests run (turns Discord's own
+    // showCurrentGame off for the duration, restores it after)
     MAX_LOG_ITEMS: 60, // UI log limit
   };
 
@@ -74,7 +75,7 @@
 
   /* ── OAuth consent gate ──────────────────────────────────────
        Shown before the ACHIEVEMENT bypass OAuth-authorizes a quest's
-       app on the user's account. Per-app, per-run, in-memory only —
+       app on the user's account. Per-app, per-run, in-memory only and
        never persisted, so it can't silently authorize forever. Default
        decline: Cancel / Esc / backdrop / 60s idle all resolve false, so
        an AFK user never authorizes anything. CSP-safe (addEventListener,
@@ -98,7 +99,7 @@
                         <div id="oc-app" style="font-weight:700;color:var(--text-strong);margin:6px 0;"></div>
                         <div style="color:var(--text-muted);">Scopes requested:</div>
                         <ul id="oc-scopes" style="margin:4px 0 10px;padding-left:18px;color:var(--text-muted);"></ul>
-                        <div style="color:var(--text-feedback-warning);">The app's backend receives a real authorization code. Missions revokes the grant immediately after the quest is marked complete. Discord enforcement against quest automation can affect the whole account.</div>
+                        <div style="color:var(--text-feedback-warning);">The app's backend receives a real authorization code. Orion revokes the grant immediately after the quest is marked complete. Discord enforcement against quest automation can affect the whole account.</div>
                         <label style="display:flex;gap:8px;align-items:center;margin-top:12px;font-size:12px;color:var(--text-muted);">
                             <input type="checkbox" id="oc-remember" class="native-cb"> Don't ask again for this app this session</label>
                     </div>
@@ -158,7 +159,7 @@
   });
 
   const CONST = Object.freeze({
-    ID: "1412491570820812933", // blacklisted quest — known to break enrollment
+    ID: "1412491570820812933", // blacklisted quest, known to break enrollment
     EVT: Object.freeze({
       HEARTBEAT: "QUESTS_SEND_HEARTBEAT_SUCCESS",
       GAME: "RUNNING_GAMES_CHANGE",
@@ -181,7 +182,7 @@
 
   // Escape server-controlled strings before they touch innerHTML. Quest and reward names
   // come from Discord API fields (questName, reward name) and can carry markup; a crafted
-  // title like "><img src=x onerror=...> would otherwise inject into the dashboard DOM —
+  // title like "><img src=x onerror=...> would otherwise inject into the dashboard DOM,
   // the exact inline-injection Discord's CSP exists to stop.
   const esc = (s) =>
     String(s ?? "").replace(
@@ -202,6 +203,66 @@
   const notExpired = (q) => {
     const e = new Date(q.config?.expiresAt ?? 0).getTime();
     return Number.isNaN(e) || e > Date.now();
+  };
+
+  // The server-sealed attribution blob Discord echoes back when enrolling in or claiming a
+  // quest. The server issues it per quest and ships it with the quest list; the client
+  // returns it unmodified. Missions sent neither sealed field, so every enrollment and claim it
+  // made lacked something present on every request the real client sends. Nothing is forged
+  // here: this is the server's own value going back where it came from.
+  const sealedFor = (questId) => {
+    try {
+      return (
+        Mods.QuestStore?.getQuest?.(questId)?.trafficMetadataSealed ?? null
+      );
+    } catch (_) {
+      return null;
+    }
+  };
+
+  // When Discord has blocked quest enrollment for this account, as a Date, otherwise null.
+  // `QuestStore.questEnrollmentBlockedUntil` comes from the same `/quests/@me` response the
+  // client already fetches, so reading it costs nothing and adds no request. A block is the
+  // clearest signal Discord gives that it has taken an interest in the account, and carrying
+  // on through it is both futile and the worst available response to it.
+  const enrollmentBlockedUntil = () => {
+    try {
+      const raw = Mods.QuestStore?.questEnrollmentBlockedUntil;
+      if (!raw) return null;
+      const when = raw instanceof Date ? raw : new Date(raw);
+      return Number.isNaN(when.getTime()) || when.getTime() <= Date.now()
+        ? null
+        : when;
+    } catch (_) {
+      return null;
+    }
+  };
+
+  // Discord joins stream key parts with a colon and the trailing component is the stream
+  // owner: `call:<channelId>:<ownerId>` for a DM, `guild:<guildId>:<channelId>:<ownerId>`
+  // for a guild voice channel, and its decoder reads them back in that order. This used to
+  // build `call:<channelId>:<rnd(1000,9999)>`, which put a four digit number where a user
+  // snowflake belongs and used the DM prefix even for a guild channel.
+  const buildStreamKey = () => {
+    try {
+      const ownerId = Mods.UserStore?.getCurrentUser?.()?.id;
+      if (!ownerId) return null;
+
+      const dm = Mods.ChanStore?.getSortedPrivateChannels()?.[0]?.id;
+      if (dm) return `call:${dm}:${ownerId}`;
+
+      for (const g of Object.values(
+        Mods.GuildChanStore?.getAllGuilds() ?? {},
+      )) {
+        const vc = g?.VOCAL?.[0]?.channel;
+        const guildId = vc?.guild_id ?? g?.id;
+        if (vc?.id && guildId) return `guild:${guildId}:${vc.id}:${ownerId}`;
+      }
+      return null;
+    } catch (e) {
+      Logger.log(`[Task] Stream key lookup error: ${e.message}`, "debug");
+      return null;
+    }
   };
 
   /* ── error classification ─────────────────────────────────── */
@@ -234,13 +295,14 @@
 
   /* ── UI + logger ────────────────────────────────────────────
        Injects a draggable dashboard into Discord's DOM.
-       Doubles as task-state store — render() rebuilds on every update.
+       Doubles as task-state store. render() rebuilds on every update.
     ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── */
 
   const Logger = {
     root: null,
     tasks: new Map(),
     tickerId: null,
+    _hotkey: null,
 
     init() {
       const oldUI = document.getElementById("orion-ui");
@@ -378,7 +440,7 @@
       this.root.innerHTML = `
                 <div id="orion-head">
                     <span id="orion-title">${ICONS.BOLT} ${CONFIG.NAME}
-                        <span class="dev-credit">by pratinha10</span>
+                        <span class="dev-credit">by pratinha</span>
                         <span style="opacity:0.6; font-size:10px; margin-left:4px; padding-top: 3px; font-weight:500;">${CONFIG.VERSION}</span>
                     </span>
                     <div id="orion-controls">
@@ -472,6 +534,15 @@
                   claimState: null,
                 });
                 setTimeout(() => this.removeTask(questId), 2000);
+              } else {
+                // 2xx without claimed_at. The reward isn't claimed, and without this
+                // branch claimState stayed WAITING forever, so the button was dead for
+                // the rest of the session with no way back.
+                this.log(
+                  `[Claim] Reward for "${taskData.name}" wasn't confirmed. Claim it from Discord's Quests page.`,
+                  "warn",
+                );
+                this.updateTask(questId, { ...taskData, claimState: "FAILED" });
               }
             } catch (err) {
               this.log(
@@ -486,11 +557,13 @@
 
       document.getElementById("orion-close").onclick = () => this.toggle();
       document.getElementById("orion-stop").onclick = () => this.shutdown();
-      document.addEventListener(
-        "keydown",
-        (e) =>
-          (e.key === ">" || (e.shiftKey && e.key === ".")) && this.toggle(),
-      );
+
+      // Keep the reference so shutdown() can detach it. An anonymous listener here
+      // survived STOP and stacked one more copy per paste, each closing over a dead
+      // dashboard, the same stacking the gear handler below is careful to avoid.
+      this._hotkey = (e) =>
+        (e.key === ">" || (e.shiftKey && e.key === ".")) && this.toggle();
+      document.addEventListener("keydown", this._hotkey);
 
       // gear toggles the picker options panel. Those nodes only exist during the picker
       // phase, so look them up at click time and no-op otherwise. Registered once here
@@ -512,6 +585,7 @@
     },
 
     toggle() {
+      if (!this.root?.parentElement) return; // dashboard already torn down
       this.root.style.display =
         this.root.style.display === "none" ? "flex" : "none";
     },
@@ -522,6 +596,10 @@
       this.log("[System] Stopping script & cleaning up...", "warn");
 
       if (this.tickerId) clearInterval(this.tickerId);
+      if (this._hotkey) {
+        document.removeEventListener("keydown", this._hotkey);
+        this._hotkey = null;
+      }
 
       for (const cleanupFn of RUNTIME.cleanups) {
         try {
@@ -533,11 +611,21 @@
       RUNTIME.cleanups.clear();
 
       Patcher.clean();
+
+      // Free the re-entry guard now, not in a second. Holding it for the grace period
+      // meant a paste inside that window was refused with "Already running.", and the
+      // UI that guard had just re-shown was then removed by this very timer, leaving
+      // nothing on screen and no hint that pasting again would work.
+      window.orionLock = false;
+
+      // Capture the nodes to drop instead of looking them up by id when the timer fires:
+      // a new instance reuses the same ids, so a late getElementById('orion-styles')
+      // would delete the *new* dashboard's stylesheet.
+      const styles = document.getElementById("orion-styles");
+      const root = this.root;
       setTimeout(() => {
-        const styles = document.getElementById("orion-styles");
-        if (styles) styles.remove();
-        if (this.root?.parentElement) this.root.remove();
-        window.orionLock = false;
+        if (styles?.parentElement) styles.remove();
+        if (root?.parentElement) root.remove();
       }, 1000);
     },
 
@@ -551,10 +639,10 @@
     // own progress locally, so free-running +1/s matches reality closely enough.
     // GAME/STREAM don't: their only source of truth is Discord's heartbeat reply, which
     // lands every ~30s. Free-running there invented a moving bar even when Discord was
-    // reporting nothing at all — it reached 100% while the quest sat at 0% in Discord's
+    // reporting nothing at all. It reached 100% while the quest sat at 0% in Discord's
     // own UI (issue #43). So they extrapolate strictly from the last heartbeat: the bar
     // is smooth while beats arrive, and frozen at the last known value when they stop.
-    // ACHIEVEMENT is a milestone count, not seconds — never ticked.
+    // ACHIEVEMENT is a milestone count, not seconds, so it is never ticked.
     SERVER_DRIVEN: ["GAME", "STREAM"],
 
     startTicker() {
@@ -567,7 +655,7 @@
 
           let cur;
           if (this.SERVER_DRIVEN.includes(task.type)) {
-            if (task.serverAt == null) continue; // no heartbeat yet — show nothing
+            if (task.serverAt == null) continue; // no heartbeat yet, show nothing
             cur = Math.min(
               task.serverCur + (Date.now() - task.serverAt) / 1000,
               task.max,
@@ -603,7 +691,8 @@
         oldData.claimState === newData.claimState &&
         oldData.actionRequired === newData.actionRequired
       ) {
-        const card = document.getElementById(`orion-task-${id}`);
+        // must match the escaped id render() writes, or the in-place update misses
+        const card = document.getElementById(`orion-task-${esc(id)}`);
         if (card) {
           const pct = this._getPct(newData);
 
@@ -730,7 +819,7 @@
             else if (t.claimState === "FAILED")
               actionBtn = `<button class="claim-btn failed" disabled>ACTION REQUIRED</button>`;
             else
-              actionBtn = `<button class="claim-btn" data-id="${id}">CLAIM REWARD</button>`;
+              actionBtn = `<button class="claim-btn" data-id="${esc(id)}">CLAIM REWARD</button>`;
           } else if (t.actionRequired === "ENROLL") {
             statusText = "ACTION REQUIRED";
             progressLabel = "Accept quest in Discord";
@@ -760,7 +849,7 @@
           }
 
           return `
-                <div id="orion-task-${id}" class="task-card ${stateClass} ${removingClass}">
+                <div id="orion-task-${esc(id)}" class="task-card ${stateClass} ${removingClass}">
                     <div class="task-icon" style="--p: ${pct}%">
                         <div class="task-icon-inner">${icon}</div>
                         ${stateClass === "running" ? `<div class="task-icon-overlay">${Math.floor(pct)}%</div>` : ""}
@@ -1038,7 +1127,7 @@
   /* ── request queue ────────────────────────────────────────────
        FIFO queue processed one-at-a-time to respect rate limits.
        Retryable errors (429, 5xx) re-queue with exponential backoff.
-       Client errors (4xx) reject immediately — caller decides what to do.
+       Client errors (4xx) reject immediately. The caller decides what to do.
     ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── */
 
   const Traffic = {
@@ -1125,16 +1214,26 @@
        RPC payloads are injected and cleaned up on task completion.
     ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── */
 
-  let Mods = {}; // populated by loadModules() — holds Discord webpack internals
+  let Mods = {}; // populated by loadModules(), holds Discord webpack internals
+
+  /* HIDE_ACTIVITY note: skipping our own LOCAL_ACTIVITY_UPDATE dispatch is not enough
+       to hide the status. Discord builds the "Playing X" presence from the store itself:
+       LocalActivityStore/ActivityTrackingStore read getVisibleRunningGames()/getVisibleGame(),
+       which we patch below for quest eligibility (issue #43). So the only way to stay
+       invisible while keeping the spoof is to turn Discord's own status.showCurrentGame off
+       for the duration and restore it on cleanup. Same setting Vencord's
+       GameActivityToggle drives. */
 
   const Patcher = {
     games: [],
     real: {},
     active: false,
+    savedShowCurrentGame: null, // value before we forced it off; null = not suppressed
+    _unhide: null, // pagehide listener, detached once the setting is restored
 
     // Overriding getRunningGames alone is no longer enough. Canary derives quest
     // eligibility from the "visible"/"candidate" views, and a game absent from those
-    // never gets a heartbeat scheduled — the quest sits at 0% forever (issue #43).
+    // never gets a heartbeat scheduled, so the quest sits at 0% forever (issue #43).
     // Older builds don't expose all of these, so each is patched only if present.
     PATCHED: [
       "getRunningGames",
@@ -1155,7 +1254,7 @@
       const absent = this.PATCHED.filter((n) => !this.real[n]);
       if (absent.length)
         Logger.log(
-          `[Patcher] Store lacks ${absent.join(", ")} — not patching those.`,
+          `[Patcher] Store lacks ${absent.join(", ")}, not patching those.`,
           "debug",
         );
     },
@@ -1174,7 +1273,7 @@
           this.games.find((g) => g.pid === pid) ||
           real.getGameForPID.call(S, pid);
 
-        // our game wins as "the" visible one — that's the whole point of the spoof
+        // our game wins as "the" visible one, which is the whole point of the spoof
         if (real.getVisibleGame)
           S.getVisibleGame = () => this.games[0] ?? real.getVisibleGame.call(S);
         if (real.getVisibleRunningGames)
@@ -1191,7 +1290,7 @@
           S.getRunningDiscordApplicationIds = () => {
             const ids = real.getRunningDiscordApplicationIds.call(S);
             const ours = this.games.map((g) => String(g.id));
-            // shape varies by build — preserve whichever collection came back
+            // shape varies by build, so preserve whichever collection came back
             return ids instanceof Set
               ? new Set([...ids, ...ours])
               : [...(ids ?? []), ...ours];
@@ -1204,10 +1303,85 @@
       }
     },
 
+    // Force showCurrentGame off while a fake game is up and HIDE_ACTIVITY is on,
+    // restore it once the last one goes away.
+    syncPresenceSuppression() {
+      const setting = Mods.ShowCurrentGame;
+      const shouldSuppress = CONFIG.HIDE_ACTIVITY && this.games.length > 0;
+
+      if (!setting) {
+        if (shouldSuppress)
+          Logger.log(
+            "[Patcher] status.showCurrentGame not found, cannot hide activity.",
+            "warn",
+          );
+        return;
+      }
+
+      if (shouldSuppress && this.savedShowCurrentGame === null) {
+        try {
+          // undefined = couldn't read it; assume it was on (Discord's default) so
+          // cleanup restores rather than silently leaving the user's status off
+          this.savedShowCurrentGame = setting.getSetting() !== false;
+          if (this.savedShowCurrentGame) {
+            Promise.resolve(setting.updateSetting(false)).catch((e) =>
+              Logger.log(
+                `[Patcher] Could not turn showCurrentGame off, activity stays visible: ${e.message}`,
+                "warn",
+              ),
+            );
+            // Reload skips shutdown entirely, and reloading is the first thing most
+            // people try when something looks stuck. Attempt the restore on the way
+            // out, and say plainly what to do if it doesn't land, because the write
+            // is async and a page teardown gives it no guarantee of completing.
+            this._unhide = () => {
+              try {
+                setting.updateSetting(true);
+              } catch (_) {}
+            };
+            window.addEventListener("pagehide", this._unhide);
+            Logger.log(
+              '[Patcher] Your "Display current activity as a status message" setting is off while quests run. STOP puts it back. If Discord is closed or reloaded before then, re-enable it in Discord settings.',
+              "warn",
+            );
+          }
+        } catch (e) {
+          this.savedShowCurrentGame = null;
+          Logger.log(
+            `[Patcher] showCurrentGame read failed, cannot hide activity: ${e.message}`,
+            "warn",
+          );
+        }
+      } else if (!shouldSuppress && this.savedShowCurrentGame !== null) {
+        const restore = this.savedShowCurrentGame;
+        this.savedShowCurrentGame = null;
+        if (this._unhide) {
+          window.removeEventListener("pagehide", this._unhide);
+          this._unhide = null;
+        }
+        if (restore) {
+          try {
+            Promise.resolve(setting.updateSetting(true)).catch((e) =>
+              Logger.log(
+                `[Patcher] Failed to restore showCurrentGame. Re-enable "Display current activity as a status message" in Discord settings: ${e.message}`,
+                "err",
+              ),
+            );
+          } catch (e) {
+            Logger.log(
+              `[Patcher] Failed to restore showCurrentGame. Re-enable "Display current activity as a status message" in Discord settings: ${e.message}`,
+              "err",
+            );
+          }
+        }
+      }
+    },
+
     add(g) {
       if (this.games.some((x) => x.pid === g.pid)) return;
       this.games.push(g);
       this.toggle(true);
+      this.syncPresenceSuppression();
       this.dispatch([g], []);
       this.rpc(g);
     },
@@ -1218,6 +1392,7 @@
       if (this.games.length === before) return;
 
       this.dispatch([], [g]);
+      this.syncPresenceSuppression();
       if (!this.games.length) {
         this.toggle(false);
         this.rpc(null);
@@ -1266,6 +1441,8 @@
     clean() {
       this.games = [];
       this.toggle(false);
+      // games emptied first, so this always restores showCurrentGame
+      this.syncPresenceSuppression();
       this.rpc(null);
     },
   };
@@ -1279,7 +1456,12 @@
     ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── */
 
   const Tasks = {
-    skipped: new Set(), // quest IDs that returned 4xx — no point retrying
+    skipped: new Set(), // quest IDs that returned 4xx, no point retrying
+    // Why the last bypass attempt gave up, so a failed achievement quest reports a real
+    // reason instead of "Cannot auto-complete". Reset at the start of every attempt.
+    lastBypassFailure: null,
+    _streamReal: undefined, // untouched StreamStore method, captured before the first spoof
+    _streamSpoofs: 0, // active STREAM tasks holding the spoof
 
     // userStatus.progress is a plain object over REST, but dispatched payloads go through
     // the client's own transform first, so the shape isn't ours to assume. Defensive: if
@@ -1308,20 +1490,30 @@
       );
     },
 
-    // match task keys from quest config to our handler types
-    // order matters — ACHIEVEMENT_IN_ACTIVITY must match before generic ACTIVITY
+    // Match task keys from the quest config to our handler types.
+    //
+    // The exact keys come first and the loose prefixes last, and that order is the whole
+    // point. This used to test `k.includes("PLAY")` before anything else, and
+    // "PLAY_ACTIVITY".includes("PLAY") is true, so every activity quest was routed to the
+    // GAME handler: it injected a fake process and then waited for heartbeats Discord does
+    // not send for an activity task, so the quest never finished and the ACTIVITY handler
+    // was unreachable for its own quest type. Verified against a live client.
+    //
+    // The prefix entries still catch platform variants (PLAY_ON_XBOX, WATCH_VIDEO_ON_MOBILE)
+    // and anything new Discord adds under the same families.
     detectType(cfg, applicationId) {
       const taskKeys = Object.keys(cfg.tasks);
       const typeMap = [
-        { key: "PLAY", type: "GAME" },
-        { key: "STREAM", type: "STREAM" },
-        { key: "VIDEO", type: "WATCH_VIDEO" },
-        { key: "ACHIEVEMENT_IN_ACTIVITY", type: "ACHIEVEMENT" },
-        { key: "ACTIVITY", type: "ACTIVITY" },
+        { match: (k) => k === "ACHIEVEMENT_IN_ACTIVITY", type: "ACHIEVEMENT" },
+        { match: (k) => k === "PLAY_ACTIVITY", type: "ACTIVITY" },
+        { match: (k) => k.startsWith("STREAM"), type: "STREAM" },
+        { match: (k) => k.includes("VIDEO"), type: "WATCH_VIDEO" },
+        { match: (k) => k.startsWith("PLAY"), type: "GAME" },
+        { match: (k) => k.includes("ACTIVITY"), type: "ACTIVITY" },
       ];
 
-      for (const { key, type } of typeMap) {
-        const keyName = taskKeys.find((k) => k.includes(key));
+      for (const { match, type } of typeMap) {
+        const keyName = taskKeys.find(match);
         if (keyName) {
           return {
             type,
@@ -1385,14 +1577,16 @@
     async claimReward(questId) {
       return await Mods.API.post({
         url: `/quests/${questId}/claim-reward`,
+        // Shaped after Discord's own claim action, which sends platform, location,
+        // is_targeted and the two sealed fields, and nothing else. Missions used to add
+        // metadata_raw and traffic_metadata_raw, which Discord never sends, while
+        // nulling the sealed value that is sitting on the quest record.
         body: {
           platform: 0,
           location: 11,
           is_targeted: false,
-          metadata_raw: null,
           metadata_sealed: null,
-          traffic_metadata_raw: null,
-          traffic_metadata_sealed: null,
+          traffic_metadata_sealed: sealedFor(questId),
         },
       });
     },
@@ -1431,23 +1625,17 @@
       const startTime = Date.now();
       let calls = 0;
 
-      // Simulate initial player buffer ping
-      if (cur === 0) {
-        await sleep(rnd(200, 350));
-        cur = 0.2 + Math.random() * 0.05;
-        try {
-          await Traffic.enqueue(`/quests/${q.id}/video-progress`, {
-            timestamp: Number(cur.toFixed(6)),
-          });
-          calls++;
-        } catch (e) {
-          Logger.log(`[Video] Initial ping failed: ${e.message}`, "debug");
-        }
-      }
+      // No synthetic first ping. It used to fire 200-350ms in with a timestamp of
+      // 0.200-0.250, which meant every video quest from every user opened with a value
+      // inside the same 50ms window. A real player reports its first tick on its own
+      // cadence, so the loop below is left to send it.
 
       while (cur < t.target && RUNTIME.running) {
-        // 2x faster than Discord's native 7-9.5s player cadence
-        const delayMs = rnd(3500, 4750);
+        // Match Discord's native player cadence. A shorter interval buys nothing:
+        // `cur` advances by real elapsed time below, so the quest still takes `target`
+        // seconds of wall clock either way, and halving the delay only doubles the
+        // number of requests. Measured: 68s target finished in 73s at 18 requests.
+        const delayMs = rnd(7000, 9500);
         await sleep(delayMs);
 
         // calculate elapsed time with execution jitter
@@ -1516,11 +1704,11 @@
       return Tasks.generic(q, t, "STREAM", "STREAM_ON_DESKTOP", s);
     },
 
-    // shared path for GAME/STREAM — injects fake process, subscribes to heartbeat events
+    // shared path for GAME/STREAM. Injects a fake process and subscribes to heartbeat events.
     async generic(q, t, type, fallbackKey, s) {
       if (!RUNTIME.running) return;
       // Prefer the key detected from the quest config. detectType matches task keys by
-      // substring, so a renamed variant (a PLAY_ON_DESKTOP_V2, say) still resolves —
+      // substring, so a renamed variant (a PLAY_ON_DESKTOP_V2, say) still resolves,
       // but reading progress under a hardcoded legacy name would return undefined and
       // pin the task at 0 until the safety timer kills it.
       const key = t.keyName || fallbackKey;
@@ -1557,20 +1745,32 @@
         let beats = 0;
 
         if (type === "STREAM") {
-          const real = Mods.StreamStore?.getStreamerActiveStreamMetadata;
           if (Mods.StreamStore) {
+            // Capture the untouched method once and refcount the spoof. Stashing it
+            // per-task meant a second concurrent STREAM task stashed the first task's
+            // spoof and later "restored" that, leaving the store patched for good.
+            if (Tasks._streamSpoofs === 0)
+              Tasks._streamReal =
+                Mods.StreamStore.getStreamerActiveStreamMetadata;
+            Tasks._streamSpoofs++;
             Mods.StreamStore.getStreamerActiveStreamMetadata = () => ({
               id: gameData.id,
               pid,
               sourceName: gameData.name,
             });
           }
-          // restore unconditionally when the store exists — assigning back an
-          // undefined `real` is the correct revert. Guarding on `real` being truthy
+          // restore unconditionally when the store exists. Assigning back an
+          // undefined original is the correct revert. Guarding on it being truthy
           // would leave our fake installed when the method was undefined at patch time.
           cleanupHook = () => {
-            if (Mods.StreamStore)
-              Mods.StreamStore.getStreamerActiveStreamMetadata = real;
+            if (
+              Mods.StreamStore &&
+              Tasks._streamSpoofs > 0 &&
+              --Tasks._streamSpoofs === 0
+            ) {
+              Mods.StreamStore.getStreamerActiveStreamMetadata =
+                Tasks._streamReal;
+            }
           };
         } else {
           Patcher.add(game);
@@ -1608,7 +1808,16 @@
               "debug",
             );
           }
-          RUNTIME.cleanups.delete(finish);
+          RUNTIME.cleanups.delete(abort);
+        };
+
+        // What shutdown runs. finish() alone clears the timers that would otherwise have
+        // resolved this promise, so registering it bare left the task pending forever.
+        // Separate from finish() so the completion path can still await onComplete
+        // (auto-claim) before resolving.
+        const abort = () => {
+          finish();
+          resolve();
         };
 
         safetyTimer = setTimeout(() => {
@@ -1632,7 +1841,7 @@
             if (cleaned || !RUNTIME.running) return;
             Logger.log(
               beats === 0
-                ? `[Task] Discord never reported progress for "${t.name}" — it isn't accepting the injected process on this client. Nothing to wait for.`
+                ? `[Task] Discord never reported progress for "${t.name}". It is not accepting the injected process on this client, so there is nothing to wait for.`
                 : `[Task] Discord stopped reporting progress for "${t.name}" after ${beats} update(s). Giving up instead of idling.`,
               "err",
             );
@@ -1673,7 +1882,7 @@
         };
 
         Mods.Dispatcher?.subscribe(CONST.EVT.HEARTBEAT, check);
-        RUNTIME.cleanups.add(finish);
+        RUNTIME.cleanups.add(abort);
       });
     },
 
@@ -1693,16 +1902,26 @@
     // POST to a CSP-restricted URL via the best available transport.
     // Returns { ok, status, body } on success, throws { status, body } on HTTP error
     // and TypeError on CSP/network. Probes in order: localhost relay (no mod needed
-    // — see tools/orion-relay/), VencordNative plugin (CSP-free via IPC to main
+    // see tools/orion-relay/), VencordNative plugin (CSP-free via IPC to main
     // process), DiscordNative HTTP candidates (if any exist), raw fetch.
     _relayUrl: "http://127.0.0.1:43210",
     _relayProbe: null,
+    _relayProbeAt: 0,
+    RELAY_PROBE_TTL: 60000, // re-probe after a minute instead of trusting one answer forever
 
     // Cache the in-flight probe promise so concurrent callers (video runs at
     // concurrency 2) all await the same result, instead of a second caller seeing
-    // a half-set flag and getting undefined (falsy) back.
+    // a half-set flag and getting undefined (falsy) back. Cached for a TTL rather than
+    // for the whole run: a permanent cache meant a relay started mid-run was never
+    // picked up, and a relay that died was still treated as available.
     _probeRelay() {
-      return (this._relayProbe ??= (async () => {
+      if (
+        this._relayProbe &&
+        Date.now() - this._relayProbeAt < this.RELAY_PROBE_TTL
+      )
+        return this._relayProbe;
+      this._relayProbeAt = Date.now();
+      return (this._relayProbe = (async () => {
         try {
           const r = await Promise.race([
             fetch(`${this._relayUrl}/health`, {
@@ -1726,23 +1945,36 @@
     },
 
     async _bypassPost(url, headers, jsonBody) {
-      // 1) Localhost relay (tools/Missions-relay/) — CSP allows http://127.0.0.1:*,
+      // 1) Localhost relay (tools/orion-relay/). CSP allows http://127.0.0.1:*,
       //    the relay forwards to discordsays.com from outside the browser sandbox.
       //    This is the no-mod path: standalone userscript + tiny helper.
       if (await this._probeRelay()) {
-        const r = await fetch(`${this._relayUrl}/proxy`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url, headers, body: jsonBody }),
-          redirect: "error",
-        });
-        if (!r.ok) throw { status: r.status, body: await r.text() };
-        const result = await r.json();
-        if (!result.ok) throw { status: result.status, body: result.body };
-        return result;
+        let r;
+        try {
+          r = await fetch(`${this._relayUrl}/proxy`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url, headers, body: jsonBody }),
+            redirect: "error",
+          });
+        } catch (e) {
+          // relay went away between probe and POST, so drop the cached answer and let
+          // the next transport try, instead of failing the whole bypass on a dead port
+          this._relayProbe = null;
+          Logger.log(
+            `[Bypass] Relay stopped responding, trying other transports: ${e?.message ?? e}`,
+            "debug",
+          );
+        }
+        if (r) {
+          if (!r.ok) throw { status: r.status, body: await r.text() };
+          const result = await r.json();
+          if (!result.ok) throw { status: result.status, body: result.body };
+          return result;
+        }
       }
 
-      // 2) Vencord plugin native module — works if user has OrionQuests Vencord plugin
+      // 2) Vencord plugin native module. Works if the user has the MissionsQuests Vencord plugin
       //    installed (`native.ts` at the repo root). Routes through Electron main process.
       try {
         const helper = window.VencordNative?.pluginHelpers?.OrionQuests;
@@ -1784,17 +2016,17 @@
         );
       }
 
-      // 3) DiscordNative HTTP probe. Best-effort — no documented method exists,
+      // 3) DiscordNative HTTP probe. Best-effort, since no documented method exists,
       //    but new Discord builds occasionally expose one. We probe several
       //    plausible paths and use the first that's a callable function.
       const dn = window.DiscordNative;
       if (dn) {
-        const probes = [
-          () => dn.http?.makeRequest,
-          () => dn.fileManager?.fetchURL,
-          () => dn.processUtils?.fetch,
-          () => dn.app?.makeRequest,
-        ];
+        // Only members that plausibly *are* an HTTP client. fileManager.fetchURL and
+        // processUtils.fetch were in this list, and neither is one: the first retrieves
+        // a URL into the file layer (a write or a save dialog, not a POST) and the second
+        // belongs to process management. Calling privileged IPC speculatively with a
+        // POST-shaped argument risks a side effect the status-shape check can't even see.
+        const probes = [() => dn.http?.makeRequest, () => dn.app?.makeRequest];
         for (const probe of probes) {
           try {
             const fn = probe();
@@ -1820,7 +2052,7 @@
         }
       }
 
-      // 4) Direct fetch — works on web Discord (no CSP) or relaxed clients.
+      // 4) Direct fetch. Works on web Discord (no CSP) or relaxed clients.
       //    CSP-blocked on Discord Desktop: throws TypeError "Failed to fetch".
       //    redirect:'error' so a 3xx from discordsays can't bounce our auth token
       //    and proxy-ticket Referer to an arbitrary host.
@@ -1841,7 +2073,12 @@
       // before it ever tried. t.appId already carries whatever Tasks.appIdFor resolved,
       // so prefer it and keep the legacy read as the last fallback (issue #43).
       const appId = t.appId || q.config?.application?.id;
-      if (!appId) return false;
+      Tasks.lastBypassFailure = null;
+      if (!appId) {
+        Tasks.lastBypassFailure =
+          "this quest carries no application id, so there is nothing to authorize against";
+        return false;
+      }
       // appId is interpolated straight into discordsays URLs. Refuse anything
       // non-numeric so a malformed/hostile id can't redirect the request elsewhere.
       if (!/^\d+$/.test(String(appId))) {
@@ -1960,30 +2197,32 @@
         );
 
         Logger.log(
-          `[Bypass] Success — "${t.name}" completed via Discord Says.`,
+          `[Bypass] Success. "${t.name}" completed via Discord Says.`,
           "success",
         );
         return true;
       } catch (e) {
         // Discord renderer CSP blocks connect-src to *.discordsays.com. fetch() throws
         // TypeError "Failed to fetch" without a status. There's no userscript workaround
-        // — the bypass needs a main-process HTTP client (Vencord plugin native module).
+        // for this: the bypass needs a main-process HTTP client (Vencord plugin native module).
         if (
           e instanceof TypeError &&
           /failed to fetch|networkerror/i.test(e.message)
         ) {
           Logger.log(
-            `[Bypass] Discord's CSP blocks the script from reaching discordsays.com. Use the Vencord plugin port for the auto-bypass — userscript can't bypass CSP. Skipping "${t.name}".`,
+            `[Bypass] Discord's CSP blocks the script from reaching discordsays.com. Use the Vencord plugin port for the auto-bypass, since a userscript cannot bypass CSP. Skipping "${t.name}".`,
             "warn",
           );
           return false;
         }
-        // Discord's API client rejects with {status, body:{code,message}}, not Error — stringify properly
+        // Discord's API client rejects with {status, body:{code,message}}, not Error, so stringify properly
         const code = e?.body?.code;
-        // 50165 = Cannot launch Age-Gated Activity — activity is age-gated or has been delisted
+        // 50165 = Cannot launch Age-Gated Activity: age-gated or delisted
         if (code === 50165) {
+          Tasks.lastBypassFailure =
+            "the activity is age-gated or delisted, so Discord refuses the proxy ticket on this account";
           Logger.log(
-            `[Bypass] "${t.name}" can't be launched (age-gated or delisted). Discord blocks the proxy ticket — nothing we can do.`,
+            `[Bypass] "${t.name}" can't be launched (age-gated or delisted). Discord blocks the proxy ticket, so there is nothing we can do.`,
             "warn",
           );
           return false;
@@ -2001,10 +2240,8 @@
             parts.push(String(e));
           }
         }
-        Logger.log(
-          `[Bypass] Failed: ${parts.join(" — ") || "unknown"}`,
-          "warn",
-        );
+        Tasks.lastBypassFailure = `the Discord Says bypass failed (${parts.join(", ") || "unknown error"})`;
+        Logger.log(`[Bypass] Failed: ${parts.join(", ") || "unknown"}`, "warn");
         return false;
       } finally {
         // Revoke ONLY the grant we created, diffed against the pre-flow snapshot.
@@ -2028,10 +2265,10 @@
       }
     },
 
-    // ACHIEVEMENT_IN_ACTIVITY — target is usually 1 (a milestone, not seconds).
+    // ACHIEVEMENT_IN_ACTIVITY. Target is usually 1 (a milestone, not seconds).
     // 1) heartbeat spoof (works for some quests)
     // 2) discordsays OAuth bypass (silver bullet)
-    // 3) skip on failure — no more 25-min passive wait
+    // 3) skip on failure, with no 25-minute passive wait
     async ACHIEVEMENT(q, t) {
       Logger.updateTask(q.id, {
         name: t.name,
@@ -2042,32 +2279,26 @@
       });
 
       // attempt active heartbeat spoofing
-      let chan = null;
-      try {
-        chan =
-          Mods.ChanStore?.getSortedPrivateChannels()?.[0]?.id ??
-          Object.values(Mods.GuildChanStore?.getAllGuilds() ?? {}).find(
-            (g) => g?.VOCAL?.length,
-          )?.VOCAL?.[0]?.channel?.id;
-      } catch (e) {
-        Logger.log(`[Achievement] Channel lookup: ${e.message}`, "debug");
-      }
+      const key = buildStreamKey();
 
-      if (chan) {
+      if (key) {
         Logger.log(
           `[Task] Attempting heartbeat spoofing for "${t.name}"...`,
           "info",
         );
-        const key = `call:${chan}:${rnd(1000, 9999)}`;
+        // Discord's own heartbeat always carries application_id. Sending only
+        // stream_key and terminal made every Missions beat structurally different.
+        const beat = {
+          stream_key: key,
+          application_id: String(t.appId || ""),
+          terminal: false,
+        };
         let cur = 0;
         let failCount = 0;
 
         while (cur < t.target && RUNTIME.running) {
           try {
-            const r = await Traffic.enqueue(`/quests/${q.id}/heartbeat`, {
-              stream_key: key,
-              terminal: false,
-            });
+            const r = await Traffic.enqueue(`/quests/${q.id}/heartbeat`, beat);
             cur =
               r?.body?.progress?.[t.keyName]?.value ??
               r?.body?.progress?.ACHIEVEMENT_IN_ACTIVITY?.value ??
@@ -2084,7 +2315,7 @@
             if (cur >= t.target) {
               try {
                 await Traffic.enqueue(`/quests/${q.id}/heartbeat`, {
-                  stream_key: key,
+                  ...beat,
                   terminal: true,
                 });
               } catch (_) {}
@@ -2114,7 +2345,7 @@
         if (cur >= t.target && RUNTIME.running) return Tasks.finish(q, t);
       }
 
-      // heartbeat path failed or skipped — try the Discord Says auth bypass
+      // heartbeat path failed or skipped, so try the Discord Says auth bypass
       if (!RUNTIME.running) return;
       const bypassed = await Tasks.bypassAchievement(q, t);
       if (bypassed) return Tasks.finish(q, t);
@@ -2122,35 +2353,35 @@
       // both auto-paths failed: skip the quest. no more 25-min passive wait.
       if (!RUNTIME.running) return;
       Logger.log(
-        `[Task] Skipping "${t.name}" — no auto-completion path worked (heartbeat rejected, bypass blocked). Likely age-gated/delisted on your account.`,
+        `[Task] Skipping "${t.name}". No auto-completion path worked (heartbeat rejected, bypass blocked). Likely age-gated/delisted on your account.`,
         "warn",
       );
-      return Tasks.failTask(q, t, "Cannot auto-complete");
+      // The bypass records why it gave up, so pass that on rather than a bare
+      // "Cannot auto-complete", which left nothing to act on.
+      return Tasks.failTask(
+        q,
+        t,
+        Tasks.lastBypassFailure ?? "no auto-completion path worked",
+      );
     },
 
     // heartbeat loop against a voice channel to simulate activity participation
     async ACTIVITY(q, t) {
-      let chan = null;
-      try {
-        chan =
-          Mods.ChanStore?.getSortedPrivateChannels()?.[0]?.id ??
-          Object.values(Mods.GuildChanStore?.getAllGuilds() ?? {}).find(
-            (g) => g?.VOCAL?.length,
-          )?.VOCAL?.[0]?.channel?.id;
-      } catch (e) {
-        Logger.log(
-          `[Task] ACTIVITY channel lookup error: ${e.message}`,
-          "debug",
-        );
-      }
-
-      if (!chan) {
+      const key = buildStreamKey();
+      if (!key) {
         return Tasks.failTask(q, t, "No voice channel found");
       }
 
-      const key = `call:${chan}:${rnd(1000, 9999)}`;
+      // Discord's own heartbeat always carries application_id. Sending only stream_key
+      // and terminal made every Orion beat structurally different from a real one.
+      const beat = {
+        stream_key: key,
+        application_id: String(t.appId || ""),
+        terminal: false,
+      };
       let cur = 0;
       let failCount = 0;
+      let stalledBeats = 0;
       Logger.updateTask(q.id, {
         name: t.name,
         type: "ACTIVITY",
@@ -2163,14 +2394,19 @@
 
       while (cur < t.target && RUNTIME.running) {
         try {
-          const r = await Traffic.enqueue(`/quests/${q.id}/heartbeat`, {
-            stream_key: key,
-            terminal: false,
-          });
-          cur =
+          const r = await Traffic.enqueue(`/quests/${q.id}/heartbeat`, beat);
+          const reported =
             r?.body?.progress?.[t.keyName]?.value ??
-            r?.body?.progress?.PLAY_ACTIVITY?.value ??
-            cur + 20;
+            r?.body?.progress?.PLAY_ACTIVITY?.value;
+          // Never invent progress. This used to fall back to `cur + 20`, so a server
+          // that credited nothing still walked the counter to target and the quest
+          // was reported complete on the strength of numbers Missions made up. Count
+          // the silent beats and give up instead.
+          if (typeof reported === "number") {
+            cur = reported;
+            stalledBeats = 0;
+          } else if (++stalledBeats >= SYS.MAX_TASK_FAILURES)
+            return Tasks.failTask(q, t, "Discord credited no progress");
           Logger.updateTask(q.id, {
             name: t.name,
             type: "ACTIVITY",
@@ -2182,7 +2418,7 @@
           if (cur >= t.target) {
             try {
               await Traffic.enqueue(`/quests/${q.id}/heartbeat`, {
-                stream_key: key,
+                ...beat,
                 terminal: true,
               });
             } catch (e) {
@@ -2241,7 +2477,7 @@
             } catch (_) {}
           }
           if (Notification.permission === "granted") {
-            new Notification("Missions: Quest Completed", {
+            new Notification("Orion: Quest Completed", {
               body: t.name,
               icon: "https://cdn.discordapp.com/emojis/1120042457007792168.webp",
               tag: `orion-${q.id}`,
@@ -2256,7 +2492,7 @@
         try {
           await sleep(rnd(2500, 6000));
           if (!RUNTIME.running) return;
-          // optimistic claim — try without captcha, show button if challenged
+          // optimistic claim. Try without captcha, show the button if challenged.
           const claimRes = await this.claimReward(q.id);
 
           if (claimRes?.body?.claimed_at) {
@@ -2275,7 +2511,7 @@
             return;
           }
         } catch (e) {
-          // captcha required or other error — fall through to claim button
+          // captcha required or other error, so fall through to the claim button
           const needsCaptcha = e?.body?.captcha_key || e?.body?.captcha_sitekey;
           if (needsCaptcha) {
             Logger.log(
@@ -2311,6 +2547,81 @@
        Dispatcher and API use structural checks instead.
     ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── */
 
+  /* Adapter over Discord's protobuf user settings, used to flip status.showCurrentGame
+       for HIDE_ACTIVITY. Deliberately not going through Vencord's UserSettingsAPI: that
+       one throws unless the *calling plugin* declared it as a dependency, and a console
+       script has no plugin manifest. The proto action creators are identified by
+       ProtoClass.typeName (Vencord's own discriminator) or the updateAsync+type===1 pair
+       (BetterDiscord's), and the BoolValue wrapper by its proto typeName. The setting
+       fields are wrapper messages, not raw booleans. */
+  function findShowCurrentGameSetting(moduleCache) {
+    if (!moduleCache) return undefined;
+
+    let actions, delay, BoolValue;
+    for (const m of Object.values(moduleCache)) {
+      try {
+        const exp = m?.exports;
+        if (!exp || typeof exp !== "object") continue;
+
+        for (const key of Object.keys(exp)) {
+          const p = exp[key];
+          if (!p) continue;
+
+          // Match by proto typeName over any export, not by an export named BoolValue:
+          // the key is minified on some builds, and then a name-only lookup misses and
+          // the write below throws. This is BetterDiscord's discriminator.
+          if (
+            !BoolValue &&
+            typeof p.create === "function" &&
+            String(p.typeName ?? "").includes("Bool")
+          )
+            BoolValue = p;
+
+          if (
+            !actions &&
+            typeof p.updateAsync === "function" &&
+            (p.ProtoClass?.typeName?.endsWith(".PreloadedUserSettings") ||
+              p.type === 1)
+          ) {
+            actions = p;
+            // enum member name varies; 0 is the "act now" delay every build accepts
+            delay = exp.UserSettingsDelay?.INFREQUENT_USER_ACTION ?? 0;
+          }
+        }
+        if (actions && BoolValue) break; // module cache is large, so stop once both are in hand
+      } catch {}
+    }
+    if (!actions) return undefined;
+    if (!BoolValue)
+      Logger.log(
+        "[Patcher] BoolValue proto type not found. Hiding activity will only work if the setting already exists.",
+        "debug",
+      );
+
+    return {
+      // undefined when the shape moved. Callers treat that as "unknown, assume on".
+      getSetting: () =>
+        actions.getCurrentValue?.()?.status?.showCurrentGame?.value,
+      updateSetting: (value) =>
+        actions.updateAsync(
+          "status",
+          (settings) => {
+            if (
+              settings.showCurrentGame &&
+              typeof settings.showCurrentGame.value === "boolean"
+            ) {
+              settings.showCurrentGame.value = value;
+            } else if (BoolValue) {
+              settings.showCurrentGame = BoolValue.create({ value });
+            } else {
+              throw new Error("BoolValue proto type not found");
+            }
+          },
+          delay,
+        ),
+    };
+  }
+
   function loadModules() {
     try {
       // === VENCORD USAGE ===
@@ -2343,11 +2654,14 @@
           StreamStore: W.findStore("ApplicationStreamingStore"),
           ChanStore: W.findStore("ChannelStore"),
           GuildChanStore: W.findStore("GuildChannelStore"),
+          UserStore: W.findStore("UserStore"),
           Dispatcher:
             W.Common?.FluxDispatcher ||
             W.findByProps("dispatch", "subscribe", "flushWaitQueue"),
           API: W.Common?.RestAPI || W.findByProps("get", "post", "del"),
           Router: routerModule,
+          // Vencord exposes the raw webpack require, so the same cache scan works here
+          ShowCurrentGame: findShowCurrentGameSetting(W.cache || W.wreq?.c),
         };
 
         const required = ["QuestStore", "API", "Dispatcher", "RunStore"];
@@ -2385,7 +2699,7 @@
       }
 
       // The push callback fires once per registered webpack runtime. Discord ships
-      // Sentry's stripped runtime alongside the real one — Sentry's `req.c` is tiny.
+      // Sentry's stripped runtime alongside the real one, and Sentry's `req.c` is tiny.
       // Pick the require with the largest cache so we ignore the Sentry instance.
       let req;
       webpackChunkdiscord_app.push([
@@ -2407,7 +2721,7 @@
       const modules = Object.values(req.c);
 
       // real Flux stores have constructor.displayName set to their class name
-      // fakes have displayName "Object" — this check never triggers Proxy traps
+      // fakes have displayName "Object". This check never triggers Proxy traps.
       function findStore(storeName) {
         for (const m of modules) {
           try {
@@ -2451,7 +2765,7 @@
         return undefined;
       }
 
-      // Discord's API client has .del (not .delete) — this distinguishes it
+      // Discord's API client has .del (not .delete), which distinguishes it
       // from generic HTTP wrappers. Also has get/post/put/patch as own props.
       function findAPI() {
         for (const m of modules) {
@@ -2502,9 +2816,11 @@
         StreamStore: findStore("ApplicationStreamingStore"),
         ChanStore: findStore("ChannelStore"),
         GuildChanStore: findStore("GuildChannelStore"),
+        UserStore: findStore("UserStore"),
         Dispatcher: findDispatcher(),
         API: findAPI(),
         Router: findRouter(),
+        ShowCurrentGame: findShowCurrentGameSetting(req.c),
       };
 
       const required = ["QuestStore", "API", "Dispatcher", "RunStore"];
@@ -2598,6 +2914,20 @@
     while (RUNTIME.running) {
       try {
         Logger.log(`[Cycle] Starting loop #${loopCount}...`, "info");
+
+        // Discord tells the client when the account may not enroll in anything, and
+        // the quest list carries the timestamp. Checked every cycle rather than once
+        // at start, because the block can land mid-run, and running past it means
+        // hammering an endpoint that is already refusing us.
+        const blockedUntil = enrollmentBlockedUntil();
+        if (blockedUntil) {
+          Logger.log(
+            `[System] Discord has blocked quest enrollment on this account until ${blockedUntil.toLocaleString()}. Stopping instead of retrying.`,
+            "err",
+          );
+          break;
+        }
+
         quests = getQuests();
 
         // Filter out completed, expired, blacklisted, skipped, AND unselected quests
@@ -2659,11 +2989,11 @@
             }
 
             // GAME/STREAM impersonate a specific application. Without a real id the
-            // fake process is unidentifiable and Discord silently never counts it —
+            // fake process is unidentifiable and Discord silently never counts it, so
             // skip loudly instead of running a task that can't finish (issue #43).
             if ((type === "GAME" || type === "STREAM") && !appId) {
               Logger.log(
-                `[Quest] "${q.config?.messages?.questName ?? q.id}" has no application id in its config — can't spoof the game. Skipping.`,
+                `[Quest] "${q.config?.messages?.questName ?? q.id}" has no application id in its config, so the game cannot be spoofed. Skipping.`,
                 "warn",
               );
               Tasks.skipped.add(q.id);
@@ -2716,6 +3046,8 @@
                   await Traffic.enqueue(`/quests/${q.id}/enroll`, {
                     location: 11,
                     is_targeted: false,
+                    metadata_sealed: null,
+                    traffic_metadata_sealed: sealedFor(q.id),
                   });
                   await sleep(rnd(800, 1500));
                 } catch (e) {
@@ -2805,7 +3137,7 @@
       }
     }
 
-    // Keep the UI alive if there are unclaimed rewards waiting — losing the
+    // Keep the UI alive if there are unclaimed rewards waiting. Losing the
     // dashboard the moment the queue finishes means users miss the CLAIM
     // buttons (especially when auto-claim is off). User can click STOP manually.
     const hasUnclaimed = [...Logger.tasks.values()].some(
